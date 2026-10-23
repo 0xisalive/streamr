@@ -52,6 +52,14 @@ export interface PlayResponse {
   session_id: string
   stream_url: string
   subtitle_url: string
+  delivery: string // "direct" | "remux" | "transcode"
+}
+
+export interface AutoPlayBody {
+  tmdb_id: number
+  type: string
+  season: number
+  episode: number
 }
 
 export interface ProgressResponse {
@@ -97,6 +105,12 @@ export async function getSources(params: SourcesParams): Promise<Candidate[]> {
 
 export async function play(body: PlayBody): Promise<PlayResponse> {
   return postJSON<PlayResponse>('/api/play', body)
+}
+
+// autoPlay is the zero-config path: the backend resolves sources, auto-picks
+// the best playable release, and starts streaming — the user only presses play.
+export async function autoPlay(body: AutoPlayBody): Promise<PlayResponse> {
+  return postJSON<PlayResponse>('/api/autoplay', body)
 }
 
 export function streamUrl(sessionId: string): string {
