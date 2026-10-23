@@ -1,0 +1,67 @@
+# streamr configuration
+# Copy to config.yaml and fill in. Secrets can alternatively be supplied via
+# environment variables (STREAMR_*), which override the file.
+#
+# Format: one "key: value" per line. Indexers use repeated torznab:/newznab:
+# lines with space-separated name=/url=/key=/enabled= fields.
+
+# --- HTTP server ---
+addr: ":8080"
+# Path to the built frontend (run `make web` or `cd web && npm run build`).
+# Leave empty to run the JSON API only (e.g. behind a separate static host).
+web_dir: "web/dist"
+# Working directory for the subtitle cache and other runtime data.
+data_dir: "./data"
+
+# --- Discovery (the Seerr-style search layer) ---
+# Free TMDB API key: https://www.themoviedb.org/settings/api
+# Env: STREAMR_TMDB_API_KEY
+tmdb_api_key: ""
+
+# --- Torrent streaming engine (qBittorrent WebUI) ---
+# Enable the WebUI in qBittorrent: Tools > Options > Web UI.
+# streamr adds torrents with sequential download so they stream in order.
+# Env: STREAMR_QBIT_URL / STREAMR_QBIT_USER / STREAMR_QBIT_PASS
+qbit_url: "http://localhost:8081"
+qbit_user: "admin"
+qbit_pass: "adminadmin"
+# qBittorrent's download directory, which must be READABLE by streamr (same
+# host, or a shared mount). This is where partial files are streamed from.
+qbit_save_dir: "/downloads"
+
+# --- Sources: MAXIMIZE COVERAGE by listing many indexers ---
+# RECOMMENDED: run Prowlarr (or Jackett) and point ONE torznab line at it.
+# Prowlarr aggregates hundreds of public AND private trackers behind a single
+# Torznab endpoint, so one line gives you the widest net. You can add more
+# lines for redundancy or to split public/private.
+#
+# Prowlarr exposes a per-app Torznab URL like:
+#   http://localhost:9696/<n>/api   (apikey from Prowlarr settings)
+torznab: name=prowlarr url=http://localhost:9696/1/api key=PROWLARR_API_KEY enabled=true
+# Example of a second, direct Jackett indexer (optional):
+# torznab: name=jackett-1337x url=http://localhost:9117/api/v2.0/indexers/1337x/results/torznab key=JACKETT_KEY enabled=false
+
+# Usenet indexers (Newznab) — the biggest win for OBSCURE / OLD content, since
+# retention servers keep content alive regardless of popularity (no dead swarm).
+# Requires a Usenet provider + indexer subscription. Enable when you have them.
+# newznab: name=nzbgeek url=https://api.nzbgeek.info/api key=NEWZNAB_KEY enabled=true
+
+# --- Subtitle alignment pipeline ---
+# OpenSubtitles supplies the raw (often-misaligned) subtitles that the tiered
+# pipeline then fixes. Free API key: https://www.opensubtitles.com/consumers
+# Env: STREAMR_OPENSUBTITLES_API_KEY
+opensubtitles_api_key: ""
+opensubtitles_user_agent: "streamr/0.1"
+# Minimum alignment confidence to ACCEPT a re-synced subtitle. Below this, the
+# original subtitle is kept unchanged (guards against making a good sub worse).
+sub_min_confidence: "0.55"
+# WhisperX is the authoritative Tier-3 forced-alignment path. It is OPT-IN
+# because it needs PyTorch (GPU strongly recommended; heavy on FreeBSD).
+# ffsubsync + alass remain the always-on baseline when this is false.
+# Env: STREAMR_WHISPERX_ENABLED
+whisperx_enabled: "false"
+
+# --- Streaming session lifecycle ---
+# Idle sessions (and their torrents) are torn down after this many minutes to
+# prevent resource leaks. 60 is a sane default.
+session_idle_timeout_minutes: "60"

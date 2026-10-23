@@ -1,0 +1,31 @@
+# Binaries
+/bin/
+/dist/
+streamr
+streamr.exe
+
+# Runtime data
+/data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+
+# Downloaded media / torrent working dirs
+/downloads/
+/cache/
+
+# Config with secrets
+config.yaml
+config.local.yaml
+.env
+
+# Frontend
+/web/node_modules/
+/web/dist/
+/web/.vite/
+
+# OS / editor
+.DS_Store
+*.swp
+*.log
