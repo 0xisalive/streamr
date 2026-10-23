@@ -70,8 +70,11 @@ func (FfsubsyncEngine) Sync(ctx context.Context, req SyncRequest) (float64, erro
 	}
 
 	if !haveScore {
-		// Could not reliably parse a score; assume a modest success.
-		return 0.6, nil
+		// Could not parse a score, so we cannot verify the sync improved — and
+		// ffsubsync's framerate search can silently RUIN an already-correct
+		// subtitle. Return a low confidence so the pipeline's gate keeps the
+		// original rather than applying an unverifiable result.
+		return 0.3, nil
 	}
 	return normalizeScore(score), nil
 }

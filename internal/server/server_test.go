@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/0xisalive/streamr/internal/config"
 	"github.com/0xisalive/streamr/internal/discovery"
@@ -33,10 +35,15 @@ type fakeEngine struct {
 func (f *fakeEngine) Protocols() []source.Protocol { return []source.Protocol{source.ProtocolTorrent} }
 func (f *fakeEngine) Open(_ context.Context, c source.Candidate) (*source.Stream, error) {
 	return &source.Stream{
-		ID:       "sess",
-		Name:     f.name,
-		Size:     int64(len(f.data)),
-		Reader:   memReader{bytes.NewReader(f.data)},
+		ID:     "sess",
+		Name:   f.name,
+		Size:   int64(len(f.data)),
+		Reader: memReader{bytes.NewReader(f.data)},
+		// Model a real engine: hand out an INDEPENDENT reader per request so
+		// concurrent Range requests don't share a seek offset.
+		NewReader: func() (source.ReadSeekraleCloser, error) {
+			return memReader{bytes.NewReader(f.data)}, nil
+		},
 		Progress: func() float64 { return 0.5 },
 		Close:    func() error { return nil },
 	}, nil
@@ -177,3 +184,75 @@ func TestConcurrentStreamRequests(t *testing.T) {
 type httpErr struct{ code int }
 
 func (e *httpErr) Error() string { return http.StatusText(e.code) }
+
+// blockingReader lets a test hold a read open while teardown is attempted, to
+// verify the session drains in-flight reads before closing.
+type blockingReader struct {
+	*bytes.Reader
+	release  chan struct{}
+	closed   *bool
+	closedMu *sync.Mutex
+}
+
+func (b *blockingReader) Read(p []byte) (int, error) {
+	<-b.release // block until the test allows the read to proceed
+	return b.Reader.Read(p)
+}
+func (b *blockingReader) Close() error {
+	b.closedMu.Lock()
+	*b.closed = true
+	b.closedMu.Unlock()
+	return nil
+}
+
+// TestTeardownWaitsForInFlightRead verifies the GC-race fix: remove() must not
+// close the stream while a read is in flight.
+func TestTeardownWaitsForInFlightRead(t *testing.T) {
+	var closed bool
+	var cmu sync.Mutex
+	release := make(chan struct{})
+	br := &blockingReader{Reader: bytes.NewReader([]byte("hello world")), release: release, closed: &closed, closedMu: &cmu}
+
+	srv := newTestServer(nil)
+	closeCalled := make(chan struct{})
+	st := &source.Stream{
+		Name: "x.mp4", Size: 11, Reader: br,
+		Close: func() error { br.Close(); close(closeCalled); return nil },
+	}
+	sess := &session{id: "tw", stream: st, mode: transcode.DirectPlay}
+	srv.sessions.add(sess)
+
+	// Start a stream read that will block inside Read.
+	readDone := make(chan struct{})
+	go func() {
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/stream/tw", nil))
+		close(readDone)
+	}()
+	time.Sleep(100 * time.Millisecond) // let the handler enter beginServe + Read
+
+	// Attempt teardown concurrently; it must block until the read drains.
+	removed := make(chan struct{})
+	go func() { srv.sessions.remove("tw"); close(removed) }()
+
+	select {
+	case <-closeCalled:
+		t.Fatal("stream.Close() ran while a read was in flight (use-after-free window)")
+	case <-time.After(150 * time.Millisecond):
+		// Good: teardown is waiting.
+	}
+
+	// Release the read; teardown should now complete and Close should run.
+	close(release)
+	<-readDone
+	select {
+	case <-removed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("teardown did not complete after read drained")
+	}
+	cmu.Lock()
+	defer cmu.Unlock()
+	if !closed {
+		t.Fatal("stream was never closed after teardown")
+	}
+}

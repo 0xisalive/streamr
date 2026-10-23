@@ -213,6 +213,9 @@ func (c *Config) Validate() []string {
 	if c.Engine == "qbittorrent" && c.QbitURL == "" {
 		warns = append(warns, "engine=qbittorrent but qbit_url not set: torrent streaming disabled")
 	}
+	if c.Engine == "qbittorrent" && strings.HasPrefix(c.QbitURL, "http://") {
+		warns = append(warns, "qbit_url is plain http://: the WebUI password is sent in cleartext — use https or a local socket")
+	}
 	if len(c.Torznab) == 0 && len(c.Newznab) == 0 {
 		warns = append(warns, "no indexers configured: source search will return nothing")
 	}

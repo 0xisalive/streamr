@@ -49,6 +49,21 @@ func TestAnacrolix_LiveStream(t *testing.T) {
 		t.Fatalf("expected positive file size, got %d", st.Size)
 	}
 
+	// Regression guard: the embedded engine MUST expose an on-disk path via the
+	// reader's Name(), otherwise the server skips probing and never
+	// remuxes/transcodes or produces subtitles (the default-engine bug).
+	if namer, ok := st.Reader.(interface{ Name() string }); !ok || namer.Name() == "" {
+		t.Fatal("embedded reader must expose a non-empty on-disk path for probing/subtitles")
+	} else {
+		t.Logf("on-disk path exposed for probing: %s", namer.Name())
+	}
+
+	// And an independent per-request reader must be available for concurrent
+	// Range serving.
+	if st.NewReader == nil {
+		t.Fatal("embedded stream must provide NewReader for per-request readers")
+	}
+
 	// Read the first 64 KiB — this must arrive via the swarm (sequential/
 	// read-ahead), proving we can play before the whole file is present.
 	buf := make([]byte, 64*1024)

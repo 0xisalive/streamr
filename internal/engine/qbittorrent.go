@@ -113,6 +113,11 @@ func (q *QBittorrent) Open(ctx context.Context, c source.Candidate) (*source.Str
 		Name:   filepath.Base(videoFile),
 		Size:   size,
 		Reader: rs,
+		NewReader: func() (source.ReadSeekraleCloser, error) {
+			// Independent *os.File per request so concurrent Range reads don't
+			// share a seek offset.
+			return os.Open(fullPath)
+		},
 		Progress: func() float64 {
 			p, _ := q.progress(context.Background(), hash)
 			return p

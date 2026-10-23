@@ -104,12 +104,24 @@ type Engine interface {
 // semantics. Size is the full length of the chosen video file; Reader lets the
 // stream endpoint seek to any offset (re-prioritizing fetch as needed).
 type Stream struct {
-	ID       string // session id
-	Name     string // video file name within the torrent/nzb
-	Size     int64  // total size of the video file in bytes
-	Reader   ReadSeekraleCloser
-	Progress func() float64 // 0..1 fraction downloaded, for the UI
-	Close    func() error   // tear down the session (also called by idle GC)
+	ID        string // session id
+	Name      string // video file name within the torrent/nzb
+	Size      int64  // total size of the video file in bytes
+	Reader    ReadSeekraleCloser
+	NewReader func() (ReadSeekraleCloser, error) // independent per-request reader
+	Progress  func() float64                     // 0..1 fraction downloaded, for the UI
+	Close     func() error                       // tear down the session (also called by idle GC)
+}
+
+// OpenReader returns an independent reader when the engine supports it (so
+// concurrent Range requests don't contend on a shared seek offset), else falls
+// back to the single shared Reader.
+func (s *Stream) OpenReader() (ReadSeekraleCloser, bool, error) {
+	if s.NewReader != nil {
+		r, err := s.NewReader()
+		return r, true, err
+	}
+	return s.Reader, false, nil
 }
 
 // ReadSeekraleCloser is io.ReadSeeker + io.Closer. When the player seeks to a

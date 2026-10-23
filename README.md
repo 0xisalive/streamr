@@ -378,6 +378,20 @@ Implemented and tested end-to-end:
   under the race detector**, including concurrent Range requests.
 - ✅ Linux + FreeBSD (amd64 + arm64) static cross-compile verified.
 
+Hardened after an independent review (see `semantic-review/`):
+
+- ✅ Embedded engine exposes the on-disk path, so probe → remux/transcode and
+  subtitle audio extraction work on the **default** engine (not just qBittorrent).
+- ✅ Per-request readers for concurrent Range serving (no shared-seek contention).
+- ✅ Session teardown drains in-flight reads before closing (no GC use-after-free).
+- ✅ HLS URL handed out only after ffmpeg writes the playlist + first segment.
+- ✅ Subtitle endpoint returns 202-until-ready; the client polls and injects the
+  track when available (no permanent 404).
+- ✅ Per-session temp dirs (HLS, extracted audio) cleaned on teardown; final VTT
+  cached in a stable path.
+- ✅ Confidence gate hardened: an unverifiable ffsubsync result no longer passes.
+- ✅ SPA path-traversal containment; cleartext-qBittorrent warning.
+
 Natural next steps:
 
 - Hardware-accelerated transcode (VAAPI/NVENC on Linux) for more concurrent HEVC streams.

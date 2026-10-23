@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"os"
 	"sync"
 	"time"
 
@@ -25,10 +26,46 @@ type session struct {
 	videoPath string // on-disk path for probe/remux/transcode (if available)
 	hlsDir    string // transcode output dir, if mode == Transcode
 	hlsStop   func() // stops the background HLS transcode
+	subsDir   string // per-session subtitle working dir (cleaned on teardown)
 
 	lastAccess time.Time
 	mu         sync.Mutex // guards lastAccess + subtitle
-	serveMu    sync.Mutex // serializes ServeContent (seek+read) on the shared reader
+
+	// serving tracks in-flight stream reads so teardown can wait for them to
+	// drain before closing the underlying reader/torrent (prevents a GC sweep
+	// from freeing the reader mid-ServeContent). closed is set under servingMu
+	// once teardown has begun, so new reads are refused.
+	servingMu sync.Mutex
+	serving   sync.WaitGroup
+	closed    bool
+}
+
+// beginServe registers an in-flight read. It returns false if the session is
+// already being torn down, in which case the caller must not touch the stream.
+func (s *session) beginServe() bool {
+	s.servingMu.Lock()
+	defer s.servingMu.Unlock()
+	if s.closed {
+		return false
+	}
+	s.serving.Add(1)
+	return true
+}
+
+func (s *session) endServe() { s.serving.Done() }
+
+// beginClose marks the session closed (refusing new reads) and waits for all
+// in-flight reads to finish. Returns false if already closed by another caller.
+func (s *session) beginClose() bool {
+	s.servingMu.Lock()
+	if s.closed {
+		s.servingMu.Unlock()
+		return false
+	}
+	s.closed = true
+	s.servingMu.Unlock()
+	s.serving.Wait() // drain in-flight reads before teardown proceeds
+	return true
 }
 
 func (s *session) touch() {
@@ -86,12 +123,25 @@ func (m *sessionManager) remove(id string) {
 	if !ok {
 		return
 	}
+	// Refuse new reads and wait for in-flight ones to drain before closing the
+	// underlying reader/torrent — otherwise a sweep could free the reader out
+	// from under an active ServeContent (use-after-free).
+	if !s.beginClose() {
+		return // already being torn down
+	}
 	// Stop any background transcode first, then tear down the torrent/stream.
 	if s.hlsStop != nil {
 		s.hlsStop()
 	}
 	if s.stream != nil && s.stream.Close != nil {
 		_ = s.stream.Close()
+	}
+	// Clean up per-session temp dirs (HLS segments, extracted audio, VTTs) so
+	// disk doesn't grow unbounded across sessions.
+	for _, d := range []string{s.hlsDir, s.subsDir} {
+		if d != "" {
+			_ = os.RemoveAll(d)
+		}
 	}
 }
 

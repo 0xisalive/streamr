@@ -85,11 +85,27 @@ func (a *Anacrolix) Open(ctx context.Context, c source.Candidate) (*source.Strea
 	reader.SetReadahead(16 << 20) // 16 MiB read-ahead window
 	reader.SetResponsive()        // reprioritize around reads/seeks
 
+	// The engine writes pieces to <dataDir>/<torrent files>; exposing that
+	// on-disk path lets ffprobe inspect the (partial) file and lets the
+	// subtitle job extract audio — WITHOUT this, the default engine would be
+	// stuck in direct-play and never produce subtitles. ffprobe/ffmpeg read
+	// only what has been downloaded, which the read-ahead reader keeps ahead
+	// of playback.
+	onDiskPath := filepath.Join(a.dataDir, vf.Path())
+
 	st := &source.Stream{
 		ID:     t.InfoHash().HexString(),
 		Name:   filepath.Base(vf.DisplayPath()),
 		Size:   vf.Length(),
-		Reader: &anacrolixReader{r: reader, size: vf.Length()},
+		Reader: &anacrolixReader{r: reader, size: vf.Length(), path: onDiskPath},
+		NewReader: func() (source.ReadSeekraleCloser, error) {
+			// Each HTTP Range request gets its own responsive read-ahead reader,
+			// so concurrent connections never share a seek offset.
+			rr := vf.NewReader()
+			rr.SetReadahead(16 << 20)
+			rr.SetResponsive()
+			return &anacrolixReader{r: rr, size: vf.Length(), path: onDiskPath}, nil
+		},
 		Progress: func() float64 {
 			total := vf.Length()
 			if total == 0 {
@@ -117,6 +133,9 @@ func (a *Anacrolix) addTorrent(ctx context.Context, c source.Candidate) (*atorre
 	case c.Infoy != "":
 		ih := metainfo.NewHashFromHex(strings.TrimSpace(c.Infoy))
 		t, _ := a.client.AddTorrentInfoHash(ih)
+		if t == nil {
+			return nil, fmt.Errorf("anacrolix: could not add infohash %q", c.Infoy)
+		}
 		return t, nil
 	case c.TorrURL != "":
 		mi, err := fetchMetaInfo(ctx, c.TorrURL)
@@ -146,12 +165,13 @@ func largestVideoFile(t *atorrent.Torrent) *atorrent.File {
 	return nil
 }
 
-// anacrolixReader adapts atorrent.Reader to source.ReadSeekraleCloser and
-// exposes Name() == "" (not file-backed on a predictable path); the server's
-// subtitle job handles the no-path case gracefully.
+// anacrolixReader adapts atorrent.Reader to source.ReadSeekraleCloser. Name()
+// returns the on-disk path of the (partial) file so the server can probe it and
+// extract audio for subtitles, mirroring the qBittorrent engine's *os.File.
 type anacrolixReader struct {
 	r    atorrent.Reader
 	size int64
+	path string
 }
 
 func (ar *anacrolixReader) Read(p []byte) (int, error) { return ar.r.Read(p) }
@@ -159,6 +179,9 @@ func (ar *anacrolixReader) Close() error               { return ar.r.Close() }
 func (ar *anacrolixReader) Seek(off int64, whence int) (int64, error) {
 	return ar.r.Seek(off, whence)
 }
+
+// Name exposes the on-disk path (implements the interface videoPathOf probes).
+func (ar *anacrolixReader) Name() string { return ar.path }
 
 // ensure io import is used for interface assertions in tests
 var _ io.ReadSeekCloser = (*anacrolixReader)(nil)

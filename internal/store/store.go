@@ -8,7 +8,6 @@ package store
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -122,9 +121,3 @@ func (s *Store) PutMeta(ctx context.Context, key, payload string, ttl time.Durat
 		key, payload, time.Now().Unix(), int64(ttl.Seconds()))
 	return err
 }
-
-func cacheKeyErr(parts ...string) error {
-	return fmt.Errorf("store: invalid key parts %v", parts)
-}
-
-var _ = cacheKeyErr

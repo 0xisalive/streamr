@@ -259,14 +259,23 @@ func (s *Server) startPlayback(w http.ResponseWriter, _ *http.Request, chosen so
 func (s *Server) startHLS(id string, sess *session, path string, mi transcode.MediaInfo) string {
 	outDir := filepath.Join(s.dataDir, "hls", id)
 	ctx, cancel := context.WithCancel(context.Background())
-	_, stop, err := s.trans.StartHLS(ctx, path, mi, transcode.HLSOptions{OutDir: outDir})
+	playlist, stop, err := s.trans.StartHLS(ctx, path, mi, transcode.HLSOptions{OutDir: outDir})
 	if err != nil {
 		cancel()
 		log.Printf("hls start failed for %s: %v; falling back to direct", id, err)
+		sess.mode = transcode.DirectPlay // keep session state consistent
 		return "/api/stream/" + id
 	}
 	sess.hlsDir = outDir
 	sess.hlsStop = func() { stop(); cancel() }
+
+	// Wait (bounded) for ffmpeg to actually write the playlist + first segment
+	// before handing the URL to the client, so the initial manifest fetch does
+	// not 404. hls.js would retry, but this removes the race the code claimed
+	// to handle.
+	if !waitForHLSReady(playlist, outDir, 20*time.Second) {
+		log.Printf("hls %s: playlist not ready within timeout; client will retry", id)
+	}
 	return "/api/hls/" + id + "/index.m3u8"
 }
 
@@ -313,6 +322,11 @@ func (s *Server) startSubtitleJob(sessionID string, chosen source.Candidate, req
 		if sess, ok := s.sessions.get(sessionID); ok {
 			sess.mu.Lock()
 			sess.subtitle = res.VTTPath
+			// Record the per-session subtitle working dir for cleanup on
+			// teardown (unless it is the shared cache path for a cache hit).
+			if !res.FromCache {
+				sess.subsDir = filepath.Join(s.dataDir, "subs", sessionID)
+			}
 			sess.mu.Unlock()
 			log.Printf("subtitle job %s ready: engine=%s applied=%v provider=%q cache=%v",
 				sessionID, res.Engine, res.Applied, res.Provider, res.FromCache)
@@ -332,9 +346,25 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Register this read so teardown waits for it to finish before closing the
+	// reader/torrent (prevents a GC sweep from freeing the reader mid-read).
+	if !sess.beginServe() {
+		writeErr(w, http.StatusGone, "session closed")
+		return
+	}
+	defer sess.endServe()
+
+	// A Transcode-mode session must be played via /api/hls, not here. If one
+	// reaches this handler, point the client at the playlist rather than
+	// serving raw, unplayable bytes.
+	if sess.mode == transcode.Transcode && sess.hlsDir != "" {
+		http.Redirect(w, r, "/api/hls/"+id+"/index.m3u8", http.StatusTemporaryRedirect)
+		return
+	}
+
 	if sess.mode == transcode.Remux && s.trans.Available() && sess.videoPath != "" {
-		// Fragmented MP4 is not seekable via Range (it is a live pipe); send the
-		// whole stream. The browser buffers progressively.
+		// Fragmented MP4 is a live pipe (not Range-seekable); stream it whole.
+		// The browser buffers progressively.
 		w.Header().Set("Content-Type", "video/mp4")
 		w.Header().Set("Accept-Ranges", "none")
 		if err := s.trans.RemuxToWriter(r.Context(), sess.videoPath, sess.mediaInfo, w); err != nil {
@@ -343,15 +373,34 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	st := sess.stream
+	// Direct play: give this request its own independent reader so concurrent
+	// Range connections never contend on a shared seek offset.
+	reader, independent, err := sess.stream.OpenReader()
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "open reader: "+err.Error())
+		return
+	}
+	if independent {
+		defer reader.Close()
+	}
 	// ServeContent parses Range, emits 206, and seeks via the ReadSeeker —
 	// which triggers the engine's piece reprioritization for responsive scrub.
-	// A single ReadSeeker is not safe for concurrent seek+read, so we serialize
-	// per session. Range reads from one player are sequential in practice; the
-	// lock only matters when a client opens several connections to one session.
-	sess.serveMu.Lock()
-	defer sess.serveMu.Unlock()
-	http.ServeContent(w, r, st.Name, time.Now(), st.Reader)
+	http.ServeContent(w, r, sess.stream.Name, time.Now(), reader)
+}
+
+// waitForHLSReady polls until the playlist and at least one .ts segment exist,
+// or the timeout elapses. Returns true if ready.
+func waitForHLSReady(playlist, outDir string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(playlist); err == nil {
+			if segs, _ := filepath.Glob(filepath.Join(outDir, "*.ts")); len(segs) > 0 {
+				return true
+			}
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return false
 }
 
 // handleHLS serves the HLS playlist and .ts segments produced by a transcode.
@@ -391,26 +440,48 @@ func (s *Server) handleProgress(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	sess, ok := s.sessions.get(id)
-	if !ok || sess.subtitle == "" {
-		writeErr(w, http.StatusNotFound, "no subtitle ready")
+	if !ok {
+		writeErr(w, http.StatusNotFound, "session not found")
 		return
 	}
-	http.ServeFile(w, r, sess.subtitle)
+	sess.mu.Lock()
+	sub := sess.subtitle
+	sess.mu.Unlock()
+	if sub == "" {
+		// Not ready yet. 202 (not 404) signals "pending, keep polling" so the
+		// client injects the <track> once it becomes available, rather than
+		// giving up on a single failed fetch.
+		if s.subs == nil {
+			writeErr(w, http.StatusNotFound, "subtitles disabled")
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]string{"status": "pending"})
+		return
+	}
+	http.ServeFile(w, r, sub)
 }
 
 // --- SPA / static ---
 
 func (s *Server) spaHandler() http.Handler {
 	fs := http.FileServer(http.Dir(s.webDir))
+	root, _ := filepath.Abs(s.webDir)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Resolve the requested path and ensure it stays within webDir before
+		// touching the filesystem (defense-in-depth around the hand-rolled
+		// os.Stat / index.html fallback; the stdlib FileServer also guards).
+		p := filepath.Join(root, filepath.Clean("/"+r.URL.Path))
+		if !strings.HasPrefix(p, root) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
 		// Serve the file if it exists; otherwise fall back to index.html so
 		// client-side routing works on deep links.
-		p := filepath.Join(s.webDir, filepath.Clean(r.URL.Path))
 		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
 			fs.ServeHTTP(w, r)
 			return
 		}
-		http.ServeFile(w, r, filepath.Join(s.webDir, "index.html"))
+		http.ServeFile(w, r, filepath.Join(root, "index.html"))
 	})
 }
 

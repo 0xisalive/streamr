@@ -154,20 +154,30 @@ func (c *Coordinator) Prepare(ctx context.Context, sessionID, videoPath string, 
 		}
 	}
 
-	// 2. Fallback / default: Whisper-on-the-go generation.
+	// 2. Fallback / default: Whisper-on-the-go generation. Timings are derived
+	// from the audio itself so they are inherently in sync; there is no
+	// reference to score against, so "confidence" here is not an alignment
+	// score — it is a cache annotation marking the source as generated. We do
+	// not inflate it to imply verified quality.
 	if engine == "" && c.generator != nil && c.generator.Available() {
 		if err := c.generator.Generate(ctx, ref, finalSRT, langOrAuto(req.Lang)); err != nil {
 			return CoordResult{}, fmt.Errorf("subtitle: generation failed and no provider succeeded: %w", err)
 		}
-		engine, confidence, applied = c.generator.Name(), 0.85, true
+		engine, confidence, applied = c.generator.Name(), 0.0, true
 	}
 
 	if engine == "" {
 		return CoordResult{}, fmt.Errorf("subtitle: no provider and no generator available")
 	}
 
-	// 3. Convert to WebVTT for the browser.
-	vttPath := filepath.Join(sessDir, "subtitle.vtt")
+	// 3. Convert to WebVTT for the browser. The final VTT goes in a STABLE
+	// cache location (not the per-session dir, which is cleaned on teardown) so
+	// a cached entry's path remains valid for reuse across sessions.
+	vttDir := filepath.Join(c.cacheDir, "cache")
+	if err := os.MkdirAll(vttDir, 0o755); err != nil {
+		return CoordResult{}, err
+	}
+	vttPath := filepath.Join(vttDir, key+".vtt")
 	if err := SRTToVTT(finalSRT, vttPath); err != nil {
 		return CoordResult{}, fmt.Errorf("subtitle: srt->vtt: %w", err)
 	}
