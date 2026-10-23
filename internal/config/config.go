@@ -104,7 +104,7 @@ func (c *Config) loadFile(path string) error {
 			continue
 		}
 		key = strings.TrimSpace(strings.ToLower(key))
-		val = strings.TrimSpace(val)
+		val = unquote(strings.TrimSpace(val))
 
 		switch key {
 		case "addr":
@@ -190,6 +190,20 @@ func parseIndexer(val string) IndexerConfig {
 	return ic
 }
 
+// unquote strips a single pair of matching surrounding quotes from a value, so
+// both `web_dir: "web/dist"` and `web_dir: web/dist` yield the path web/dist.
+// Without this, quoted values in config.example.yaml were parsed WITH the
+// quotes, producing invalid paths/addresses (e.g. a 404 because the web dir
+// `"web/dist"` with quotes does not exist).
+func unquote(v string) string {
+	if len(v) >= 2 {
+		if (v[0] == '"' && v[len(v)-1] == '"') || (v[0] == '\'' && v[len(v)-1] == '\'') {
+			return v[1 : len(v)-1]
+		}
+	}
+	return v
+}
+
 func parseBool(v string) bool {
 	switch strings.ToLower(strings.TrimSpace(v)) {
 	case "1", "true", "yes", "on":
@@ -218,6 +232,16 @@ func (c *Config) Validate() []string {
 	}
 	if len(c.Torznab) == 0 && len(c.Newznab) == 0 {
 		warns = append(warns, "no indexers configured: source search will return nothing")
+	}
+	// The web UI only works if web_dir points at the built frontend. An empty
+	// or non-existent path means "/" returns 404 — the most common first-run
+	// surprise — so surface it explicitly.
+	if c.WebDir == "" {
+		warns = append(warns, "web_dir not set: the web UI is disabled and GET / returns 404 (set web_dir: \"web/dist\" and run 'make web')")
+	} else if fi, err := os.Stat(c.WebDir); err != nil || !fi.IsDir() {
+		warns = append(warns, fmt.Sprintf("web_dir %q does not exist: GET / will 404 (run 'make web' to build the frontend, or fix the path)", c.WebDir))
+	} else if _, err := os.Stat(c.WebDir + "/index.html"); err != nil {
+		warns = append(warns, fmt.Sprintf("web_dir %q has no index.html: the frontend may not be built (run 'make web')", c.WebDir))
 	}
 	return warns
 }
