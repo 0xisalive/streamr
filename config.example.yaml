@@ -7,8 +7,11 @@
 
 # --- HTTP server ---
 addr: ":8080"
-# Path to the built frontend (run `make web` or `cd web && npm run build`).
-# Leave empty to run the JSON API only (e.g. behind a separate static host).
+# Path to the built frontend. REQUIRED for the web UI — if this is unset or the
+# path doesn't exist, GET / returns 404 (you'd only have the JSON API). Build it
+# first with `make web` (or `cd web && npm run build`), which creates web/dist.
+# The path is relative to the directory you run streamr from; use an absolute
+# path if you run the binary from elsewhere (e.g. a systemd service).
 web_dir: "web/dist"
 # Working directory for the subtitle cache and other runtime data.
 data_dir: "./data"
