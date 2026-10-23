@@ -1,8 +1,9 @@
 # Binaries
 /bin/
 /dist/
-streamr
-streamr.exe
+# Anchored to the repo root so it does NOT match the cmd/streamr/ source dir.
+/streamr
+/streamr.exe
 
 # Runtime data
 /data/
