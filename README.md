@@ -122,6 +122,12 @@ make dist         # → dist/streamr-{linux-amd64,freebsd-amd64,freebsd-arm64}
 No manual steps are listed here that touch your system config or credentials
 beyond the config file below.
 
+### Distro-specific guides
+
+- **Rocky Linux 10** (and RHEL/Alma 10): a complete step-by-step install —
+  every package, Prowlarr via Podman, and a systemd service — is in
+  [`docs/INSTALL-rocky-linux-10.md`](docs/INSTALL-rocky-linux-10.md).
+
 ---
 
 ## Configure
