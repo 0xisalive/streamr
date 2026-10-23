@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/0xisalive/streamr/internal/source"
+	"github.com/0xisalive/streamr/internal/transcode"
 )
 
 // session holds a live stream plus bookkeeping for idle garbage collection.
@@ -13,11 +14,21 @@ import (
 // that torrents accumulate and leak resources; we track last-access per session
 // and tear down anything idle past the timeout.
 type session struct {
-	id         string
-	stream     *source.Stream
-	subtitle   string // path/URL of the aligned subtitle, if any
+	id        string
+	stream    *source.Stream
+	candidate source.Candidate
+	subtitle  string // path of the aligned/generated WebVTT, once ready
+
+	// delivery
+	mode      transcode.Mode
+	mediaInfo transcode.MediaInfo
+	videoPath string // on-disk path for probe/remux/transcode (if available)
+	hlsDir    string // transcode output dir, if mode == Transcode
+	hlsStop   func() // stops the background HLS transcode
+
 	lastAccess time.Time
-	mu         sync.Mutex
+	mu         sync.Mutex // guards lastAccess + subtitle
+	serveMu    sync.Mutex // serializes ServeContent (seek+read) on the shared reader
 }
 
 func (s *session) touch() {
@@ -72,7 +83,14 @@ func (m *sessionManager) remove(id string) {
 	s, ok := m.sessions[id]
 	delete(m.sessions, id)
 	m.mu.Unlock()
-	if ok && s.stream != nil && s.stream.Close != nil {
+	if !ok {
+		return
+	}
+	// Stop any background transcode first, then tear down the torrent/stream.
+	if s.hlsStop != nil {
+		s.hlsStop()
+	}
+	if s.stream != nil && s.stream.Close != nil {
 		_ = s.stream.Close()
 	}
 }
@@ -101,12 +119,20 @@ func (m *sessionManager) sweep() {
 		}
 	}
 	m.mu.RUnlock()
+	// Tear down expired sessions concurrently — a slow torrent drop or ffmpeg
+	// kill on one session must not stall cleanup of the others.
+	var wg sync.WaitGroup
 	for _, id := range expired {
-		m.remove(id)
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			m.remove(id)
+		}(id)
 	}
+	wg.Wait()
 }
 
-// shutdown stops the sweeper and tears down every session.
+// shutdown stops the sweeper and tears down every session in parallel.
 func (m *sessionManager) shutdown(_ context.Context) {
 	close(m.stop)
 	m.mu.Lock()
@@ -115,7 +141,13 @@ func (m *sessionManager) shutdown(_ context.Context) {
 		ids = append(ids, id)
 	}
 	m.mu.Unlock()
+	var wg sync.WaitGroup
 	for _, id := range ids {
-		m.remove(id)
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			m.remove(id)
+		}(id)
 	}
+	wg.Wait()
 }

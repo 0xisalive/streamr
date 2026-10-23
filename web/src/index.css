@@ -260,8 +260,37 @@ button {
   color: #8fffd6;
 }
 
+.badge-direct {
+  background: #1f4d2a;
+  color: #8fff9e;
+}
+
+.badge-remux {
+  background: #4d451f;
+  color: #ffe28f;
+}
+
+.badge-transcode {
+  background: #4d2a1f;
+  color: #ff9e8f;
+}
+
 .play {
   padding: 7px 16px;
+}
+
+.play-auto {
+  margin: 8px 0 20px;
+  font-size: 1rem;
+  background: #2f6f3f;
+  padding: 10px 20px;
+}
+
+.watch-meta {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  margin-top: 10px;
 }
 
 /* Watch */

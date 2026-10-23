@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { getSources, play } from '../api.ts'
-import type { Candidate, MediaType } from '../api.ts'
+import { autoPlay, getSources, play } from '../api.ts'
+import type { Candidate, MediaType, PlayResponse } from '../api.ts'
 
 function formatSize(bytes: number): string {
   if (!bytes) return '—'
@@ -46,6 +46,17 @@ export default function Title() {
     }
   }, [tmdbId, mediaType])
 
+  function goWatch(res: PlayResponse) {
+    navigate('/watch', {
+      state: {
+        stream_url: res.stream_url,
+        subtitle_url: res.subtitle_url,
+        session_id: res.session_id,
+        delivery: res.delivery,
+      },
+    })
+  }
+
   async function onPlay(index: number) {
     setPlayingIndex(index)
     setError(null)
@@ -57,15 +68,27 @@ export default function Title() {
         season: 0,
         episode: 0,
       })
-      navigate('/watch', {
-        state: {
-          stream_url: res.stream_url,
-          subtitle_url: res.subtitle_url,
-          session_id: res.session_id,
-        },
-      })
+      goWatch(res)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to start playback')
+      setPlayingIndex(null)
+    }
+  }
+
+  // One-click: let the backend pick the best source automatically.
+  async function onAutoPlay() {
+    setPlayingIndex(-2) // sentinel for "auto"
+    setError(null)
+    try {
+      const res = await autoPlay({
+        tmdb_id: tmdbId,
+        type: mediaType,
+        season: 0,
+        episode: 0,
+      })
+      goWatch(res)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Auto-play failed')
       setPlayingIndex(null)
     }
   }
@@ -79,6 +102,14 @@ export default function Title() {
       <p className="subtitle">
         {mediaType.toUpperCase()} · TMDB #{tmdbId}
       </p>
+
+      <button
+        className="play play-auto"
+        disabled={playingIndex !== null}
+        onClick={onAutoPlay}
+      >
+        {playingIndex === -2 ? 'Starting…' : '▶ Play (auto-pick best source)'}
+      </button>
 
       {error && <p className="error">{error}</p>}
       {loading && <p className="empty">Loading sources…</p>}

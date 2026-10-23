@@ -28,7 +28,9 @@ func ParseReleaseAttrs(c *Candidate) {
 	if m := reContainer.FindString(title); m != "" {
 		c.Container = strings.ToLower(strings.TrimPrefix(m, "."))
 	}
-	if m := reGroup.FindStringSubmatch(title); len(m) == 2 {
+	// Strip a trailing video extension so "-GRP.mkv" yields group "GRP".
+	forGroup := reVideoExt.ReplaceAllString(title, "")
+	if m := reGroup.FindStringSubmatch(forGroup); len(m) == 2 {
 		c.Group = m[1]
 	}
 }
@@ -39,5 +41,6 @@ var (
 	reH264       = regexp.MustCompile(`(?i)\b(x264|h\.?264|avc)\b`)
 	reAV1        = regexp.MustCompile(`(?i)\bav1\b`)
 	reContainer  = regexp.MustCompile(`(?i)\.(mp4|mkv|avi|m4v|webm)\b`)
+	reVideoExt   = regexp.MustCompile(`(?i)\.(mp4|mkv|avi|m4v|webm|mov)$`)
 	reGroup      = regexp.MustCompile(`-([A-Za-z0-9]+)$`)
 )

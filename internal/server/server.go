@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/0xisalive/streamr/internal/discovery"
 	"github.com/0xisalive/streamr/internal/source"
 	"github.com/0xisalive/streamr/internal/subtitle"
+	"github.com/0xisalive/streamr/internal/transcode"
 )
 
 // Server holds all wired dependencies.
@@ -28,8 +30,11 @@ type Server struct {
 	resolver *source.Resolver
 	engine   source.Engine
 	subs     *subtitle.Coordinator // may be nil if no subtitle providers configured
+	prober   transcode.Prober
+	trans    transcode.Transcoder
 	sessions *sessionManager
 	webDir   string
+	dataDir  string
 
 	// candidate cache per (tmdb,type,season,episode) so /play can reference a
 	// candidate index returned by a prior /sources call.
@@ -37,18 +42,32 @@ type Server struct {
 	candCache map[string][]source.Candidate
 }
 
-// New builds the server. engine and subs may be nil; the API still serves
+// Deps bundles the server's wired dependencies.
+type Deps struct {
+	Config   config.Config
+	TMDB     *discovery.Client
+	Resolver *source.Resolver
+	Engine   source.Engine
+	Subs     *subtitle.Coordinator
+	Prober   transcode.Prober
+	Trans    transcode.Transcoder
+}
+
+// New builds the server. Engine and Subs may be nil; the API still serves
 // discovery/search without them.
-func New(cfg config.Config, tmdb *discovery.Client, resolver *source.Resolver, engine source.Engine, subs *subtitle.Coordinator) *Server {
-	idle := time.Duration(cfg.SessionIdleTimeoutMinutes) * time.Minute
+func New(d Deps) *Server {
+	idle := time.Duration(d.Config.SessionIdleTimeoutMinutes) * time.Minute
 	return &Server{
-		cfg:       cfg,
-		tmdb:      tmdb,
-		resolver:  resolver,
-		engine:    engine,
-		subs:      subs,
+		cfg:       d.Config,
+		tmdb:      d.TMDB,
+		resolver:  d.Resolver,
+		engine:    d.Engine,
+		subs:      d.Subs,
+		prober:    d.Prober,
+		trans:     d.Trans,
 		sessions:  newSessionManager(idle),
-		webDir:    cfg.WebDir,
+		webDir:    d.Config.WebDir,
+		dataDir:   d.Config.DataDir,
 		candCache: make(map[string][]source.Candidate),
 	}
 }
@@ -59,7 +78,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/search", s.handleSearch)
 	mux.HandleFunc("GET /api/sources", s.handleSources)
 	mux.HandleFunc("POST /api/play", s.handlePlay)
+	// Zero-config "just press play": resolve sources and auto-pick the best one.
+	mux.HandleFunc("POST /api/autoplay", s.handleAutoPlay)
 	mux.HandleFunc("GET /api/stream/{id}", s.handleStream)
+	// HLS playlist + segments for the transcode delivery path.
+	mux.HandleFunc("GET /api/hls/{id}/{file}", s.handleHLS)
 	mux.HandleFunc("GET /api/progress/{id}", s.handleProgress)
 	mux.HandleFunc("GET /api/subtitle/{id}", s.handleSubtitle)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -147,9 +170,50 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "candidate not found; call /api/sources first")
 		return
 	}
-	chosen := cands[req.CandidateIndex]
+	s.startPlayback(w, r, cands[req.CandidateIndex], req)
+}
 
-	// Opening can take a moment (metadata fetch); cap it.
+// handleAutoPlay is the zero-config path: given only a title (tmdb id + type),
+// it resolves sources, auto-picks the highest-ranked playable candidate, and
+// starts streaming — so the user truly only searches and presses play.
+func (s *Server) handleAutoPlay(w http.ResponseWriter, r *http.Request) {
+	if s.engine == nil {
+		writeErr(w, http.StatusServiceUnavailable, "streaming engine not configured")
+		return
+	}
+	var req playRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+
+	q := source.Query{
+		Type:    mediaType(req.Type),
+		TmdbID:  req.TmdbID,
+		Season:  req.Season,
+		Episode: req.Episode,
+	}
+	if s.tmdb.Enabled() && req.TmdbID != 0 {
+		if imdb, err := s.tmdb.ExternalIDs(r.Context(), req.TmdbID, tmdbAPIType(req.Type)); err == nil {
+			q.ImdbID = imdb
+		}
+	}
+	cands, errs := s.resolver.Resolve(r.Context(), q)
+	for _, e := range errs {
+		log.Printf("autoplay source %s error: %v", e.Source, e.Err)
+	}
+	if len(cands) == 0 {
+		writeErr(w, http.StatusNotFound, "no playable sources found for this title")
+		return
+	}
+	// Resolver already ranks best-first; take the top candidate.
+	s.startPlayback(w, r, cands[0], req)
+}
+
+// startPlayback opens the engine stream for a candidate, creates a session,
+// probes the media to choose a delivery mode (direct/remux/HLS), kicks off the
+// async subtitle job, and returns the stream/subtitle URLs.
+func (s *Server) startPlayback(w http.ResponseWriter, _ *http.Request, chosen source.Candidate, req playRequest) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	stream, err := s.engine.Open(ctx, chosen)
@@ -159,38 +223,65 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id := newID()
-	sess := &session{id: id, stream: stream}
+	sess := &session{id: id, stream: stream, candidate: chosen}
 	s.sessions.add(sess)
 
-	// Subtitle alignment runs asynchronously so playback can begin immediately.
-	// The client polls /api/subtitle/{id}; when the aligned WebVTT is ready the
-	// session is updated and the track becomes available.
+	// Decide delivery mode by probing the (partial) file. Falls back to direct
+	// play if probing is unavailable (e.g. no ffprobe, or no file path).
+	streamURL := "/api/stream/" + id
+	mode := transcode.DirectPlay
+	if path := videoPathOf(stream); path != "" && s.prober.Available() {
+		if mi, perr := s.prober.Probe(ctx, path); perr == nil {
+			mode = transcode.Decide(mi)
+			sess.mediaInfo = mi
+			sess.videoPath = path
+			if mode == transcode.Transcode {
+				streamURL = s.startHLS(id, sess, path, mi)
+			}
+		}
+	}
+	sess.mode = mode
+
 	if s.subs != nil {
 		s.startSubtitleJob(id, chosen, req)
 	}
 
-	resp := map[string]string{
+	writeJSON(w, http.StatusOK, map[string]string{
 		"session_id":   id,
-		"stream_url":   "/api/stream/" + id,
+		"stream_url":   streamURL,
 		"subtitle_url": "/api/subtitle/" + id,
-	}
-	writeJSON(w, http.StatusOK, resp)
+		"delivery":     mode.String(),
+	})
 }
 
-// startSubtitleJob fetches + aligns a subtitle for the session in the
-// background. videoPath is derived from the stream's on-disk file (the
-// qBittorrent engine backs Stream.Reader with an *os.File).
+// startHLS launches a background HLS transcode for the session and returns the
+// playlist URL the client should load with hls.js.
+func (s *Server) startHLS(id string, sess *session, path string, mi transcode.MediaInfo) string {
+	outDir := filepath.Join(s.dataDir, "hls", id)
+	ctx, cancel := context.WithCancel(context.Background())
+	_, stop, err := s.trans.StartHLS(ctx, path, mi, transcode.HLSOptions{OutDir: outDir})
+	if err != nil {
+		cancel()
+		log.Printf("hls start failed for %s: %v; falling back to direct", id, err)
+		return "/api/stream/" + id
+	}
+	sess.hlsDir = outDir
+	sess.hlsStop = func() { stop(); cancel() }
+	return "/api/hls/" + id + "/index.m3u8"
+}
+
+// startSubtitleJob fetches/generates + aligns a subtitle for the session in the
+// background so playback begins immediately. The subtitle Coordinator will fall
+// back to Whisper-on-the-go generation when an external provider is unavailable
+// or rate-limited, so a track is produced even for obscure titles.
 func (s *Server) startSubtitleJob(sessionID string, chosen source.Candidate, req playRequest) {
 	sess, ok := s.sessions.get(sessionID)
 	if !ok {
 		return
 	}
-	videoPath := ""
-	if f, ok := sess.stream.Reader.(interface{ Name() string }); ok {
-		videoPath = f.Name() // *os.File.Name() returns its path
-	}
+	videoPath := videoPathOf(sess.stream)
 	if videoPath == "" {
-		return
+		return // engine with no on-disk path; nothing to extract audio from yet
 	}
 
 	imdb := ""
@@ -199,16 +290,21 @@ func (s *Server) startSubtitleJob(sessionID string, chosen source.Candidate, req
 			imdb = id
 		}
 	}
+	releaseID := chosen.Infoy
+	if releaseID == "" {
+		releaseID = chosen.Title
+	}
 
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 		defer cancel()
 		res, err := s.subs.Prepare(ctx, sessionID, videoPath, subtitle.FetchRequest{
-			Title:   chosen.Title,
-			ImdbID:  imdb,
-			Lang:    "en",
-			Season:  req.Season,
-			Episode: req.Episode,
+			Title:     chosen.Title,
+			ImdbID:    imdb,
+			Lang:      "en",
+			Season:    req.Season,
+			Episode:   req.Episode,
+			ReleaseID: releaseID,
 		})
 		if err != nil {
 			log.Printf("subtitle job %s failed: %v", sessionID, err)
@@ -218,16 +314,16 @@ func (s *Server) startSubtitleJob(sessionID string, chosen source.Candidate, req
 			sess.mu.Lock()
 			sess.subtitle = res.VTTPath
 			sess.mu.Unlock()
-			log.Printf("subtitle job %s ready: engine=%s applied=%v provider=%s",
-				sessionID, res.Pipeline.Engine, res.Pipeline.Applied, res.Provider)
+			log.Printf("subtitle job %s ready: engine=%s applied=%v provider=%q cache=%v",
+				sessionID, res.Engine, res.Applied, res.Provider, res.FromCache)
 		}
 	}()
 }
 
-// handleStream serves the (partial) video file with HTTP Range support.
-// http.ServeContent does all the heavy lifting: it parses the Range header,
-// emits 206 Partial Content, and uses the io.ReadSeeker to serve the requested
-// window. Seeking triggers the engine's piece re-prioritization via Seek.
+// handleStream serves the video with HTTP Range support. For DirectPlay it
+// streams the raw (partial) file; for Remux it pipes an on-the-fly fragmented
+// MP4 from ffmpeg (browser-native codecs, wrong container). Transcode mode is
+// served separately via HLS, so it should not reach here.
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	sess, ok := s.sessions.get(id)
@@ -235,9 +331,47 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "session not found")
 		return
 	}
+
+	if sess.mode == transcode.Remux && s.trans.Available() && sess.videoPath != "" {
+		// Fragmented MP4 is not seekable via Range (it is a live pipe); send the
+		// whole stream. The browser buffers progressively.
+		w.Header().Set("Content-Type", "video/mp4")
+		w.Header().Set("Accept-Ranges", "none")
+		if err := s.trans.RemuxToWriter(r.Context(), sess.videoPath, sess.mediaInfo, w); err != nil {
+			log.Printf("remux stream %s ended: %v", id, err)
+		}
+		return
+	}
+
 	st := sess.stream
-	// ServeContent needs an io.ReadSeeker; our ReadSeekraleCloser satisfies it.
+	// ServeContent parses Range, emits 206, and seeks via the ReadSeeker —
+	// which triggers the engine's piece reprioritization for responsive scrub.
+	// A single ReadSeeker is not safe for concurrent seek+read, so we serialize
+	// per session. Range reads from one player are sequential in practice; the
+	// lock only matters when a client opens several connections to one session.
+	sess.serveMu.Lock()
+	defer sess.serveMu.Unlock()
 	http.ServeContent(w, r, st.Name, time.Now(), st.Reader)
+}
+
+// handleHLS serves the HLS playlist and .ts segments produced by a transcode.
+func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	file := r.PathValue("file")
+	sess, ok := s.sessions.get(id)
+	if !ok || sess.hlsDir == "" {
+		writeErr(w, http.StatusNotFound, "no HLS session")
+		return
+	}
+	// Prevent path traversal; only serve the playlist and segment files.
+	clean := filepath.Base(file)
+	full := filepath.Join(sess.hlsDir, clean)
+	if strings.HasSuffix(clean, ".m3u8") {
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	} else if strings.HasSuffix(clean, ".ts") {
+		w.Header().Set("Content-Type", "video/mp2t")
+	}
+	http.ServeFile(w, r, full)
 }
 
 func (s *Server) handleProgress(w http.ResponseWriter, r *http.Request) {
@@ -319,6 +453,20 @@ func newID() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// videoPathOf returns the on-disk path backing a stream, if the engine exposes
+// one. The qBittorrent engine backs Reader with an *os.File; the anacrolix
+// engine's reader implements Name() returning "" (no stable path), in which
+// case audio extraction / probing is skipped gracefully.
+func videoPathOf(st *source.Stream) string {
+	if st == nil || st.Reader == nil {
+		return ""
+	}
+	if f, ok := st.Reader.(interface{ Name() string }); ok {
+		return f.Name()
+	}
+	return ""
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

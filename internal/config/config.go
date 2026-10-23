@@ -21,7 +21,11 @@ type Config struct {
 	// Discovery
 	TMDBAPIKey string
 
-	// Torrent engine (qBittorrent WebUI)
+	// Torrent engine selection: "embedded" (default; no external daemon, ships
+	// in the binary) or "qbittorrent" (drive an existing qBittorrent WebUI).
+	Engine string
+
+	// qBittorrent WebUI (only used when Engine == "qbittorrent")
 	QbitURL     string
 	QbitUser    string
 	QbitPass    string
@@ -33,7 +37,10 @@ type Config struct {
 
 	// Subtitle pipeline
 	SubMinConfidence    float64
-	WhisperXEnabled     bool
+	WhisperXEnabled     bool   // opt-in Tier-3 aligner (forced alignment)
+	WhisperGenEnabled   bool   // DEFAULT: generate subtitles from audio (quota-free)
+	WhisperModel        string // tiny|base|small|medium|large (default "base")
+	WhisperDevice       string // "cpu" | "cuda" (default "cpu")
 	OpenSubtitlesAPIKey string
 	OpenSubtitlesUA     string
 
@@ -53,7 +60,11 @@ func Default() Config {
 	return Config{
 		Addr:                      ":8080",
 		DataDir:                   "./data",
+		Engine:                    "embedded", // self-contained; no external client to install
 		SubMinConfidence:          0.55,
+		WhisperGenEnabled:         true, // quota-free subtitles by default
+		WhisperModel:              "base",
+		WhisperDevice:             "cpu",
 		SessionIdleTimeoutMinutes: 60,
 	}
 }
@@ -112,12 +123,20 @@ func (c *Config) loadFile(path string) error {
 			c.QbitPass = val
 		case "qbit_save_dir":
 			c.QbitSaveDir = val
+		case "engine":
+			c.Engine = val
 		case "sub_min_confidence":
 			if v, err := strconv.ParseFloat(val, 64); err == nil {
 				c.SubMinConfidence = v
 			}
 		case "whisperx_enabled":
 			c.WhisperXEnabled = parseBool(val)
+		case "whisper_gen_enabled":
+			c.WhisperGenEnabled = parseBool(val)
+		case "whisper_model":
+			c.WhisperModel = val
+		case "whisper_device":
+			c.WhisperDevice = val
 		case "opensubtitles_api_key":
 			c.OpenSubtitlesAPIKey = val
 		case "opensubtitles_user_agent":
@@ -191,8 +210,8 @@ func (c *Config) Validate() []string {
 	if c.TMDBAPIKey == "" {
 		warns = append(warns, "TMDB api key not set: search/discovery disabled")
 	}
-	if c.QbitURL == "" {
-		warns = append(warns, "qBittorrent URL not set: torrent streaming disabled")
+	if c.Engine == "qbittorrent" && c.QbitURL == "" {
+		warns = append(warns, "engine=qbittorrent but qbit_url not set: torrent streaming disabled")
 	}
 	if len(c.Torznab) == 0 && len(c.Newznab) == 0 {
 		warns = append(warns, "no indexers configured: source search will return nothing")

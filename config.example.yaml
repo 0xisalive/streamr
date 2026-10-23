@@ -18,16 +18,22 @@ data_dir: "./data"
 # Env: STREAMR_TMDB_API_KEY
 tmdb_api_key: ""
 
-# --- Torrent streaming engine (qBittorrent WebUI) ---
-# Enable the WebUI in qBittorrent: Tools > Options > Web UI.
-# streamr adds torrents with sequential download so they stream in order.
+# --- Torrent streaming engine ---
+# "embedded" (DEFAULT): a BitTorrent client is built into streamr — nothing to
+#   install or configure. It downloads pieces in playback order and supports
+#   seek (piece reprioritization). This is the recommended, zero-setup option.
+# "qbittorrent": drive an existing qBittorrent WebUI instead (see below).
+engine: "embedded"
+
+# Only used when engine == "qbittorrent":
+# Enable the WebUI in qBittorrent (Tools > Options > Web UI). streamr adds
+# torrents with sequential download so they stream in order.
 # Env: STREAMR_QBIT_URL / STREAMR_QBIT_USER / STREAMR_QBIT_PASS
-qbit_url: "http://localhost:8081"
-qbit_user: "admin"
-qbit_pass: "adminadmin"
-# qBittorrent's download directory, which must be READABLE by streamr (same
-# host, or a shared mount). This is where partial files are streamed from.
-qbit_save_dir: "/downloads"
+# qbit_url: "http://localhost:8081"
+# qbit_user: "admin"
+# qbit_pass: "adminadmin"
+# qbit's download dir, which must be READABLE by streamr (same host / shared mount):
+# qbit_save_dir: "/downloads"
 
 # --- Sources: MAXIMIZE COVERAGE by listing many indexers ---
 # RECOMMENDED: run Prowlarr (or Jackett) and point ONE torznab line at it.
@@ -46,18 +52,35 @@ torznab: name=prowlarr url=http://localhost:9696/1/api key=PROWLARR_API_KEY enab
 # Requires a Usenet provider + indexer subscription. Enable when you have them.
 # newznab: name=nzbgeek url=https://api.nzbgeek.info/api key=NEWZNAB_KEY enabled=true
 
-# --- Subtitle alignment pipeline ---
-# OpenSubtitles supplies the raw (often-misaligned) subtitles that the tiered
-# pipeline then fixes. Free API key: https://www.opensubtitles.com/consumers
+# --- Subtitles ---
+# streamr produces subtitles two ways, in this order:
+#   1. If OpenSubtitles is configured, fetch a subtitle and ALIGN it to the
+#      audio via the tiered pipeline (ffsubsync -> alass -> whisperx).
+#   2. Otherwise — or if OpenSubtitles has no result / is rate-limited (the free
+#      tier allows only ~20 downloads/day) — GENERATE subtitles directly from
+#      the audio with Whisper-on-the-go. This is the quota-free DEFAULT and
+#      works even for obscure titles with no existing subtitle.
+# Generated/aligned subtitles are cached in SQLite, so the expensive work runs
+# once per (release, language).
+
+# OpenSubtitles (optional). Free API key: https://www.opensubtitles.com/consumers
 # Env: STREAMR_OPENSUBTITLES_API_KEY
 opensubtitles_api_key: ""
 opensubtitles_user_agent: "streamr/0.1"
+
+# Whisper-on-the-go generation (DEFAULT ON). Needs a whisper CLI on PATH —
+# install ONE of: faster-whisper (recommended, CPU-friendly) or openai-whisper.
+#   pip install faster-whisper   # provides `whisper-ctranslate2`
+#   pip install -U openai-whisper # provides `whisper`
+whisper_gen_enabled: "true"
+whisper_model: "base"     # tiny|base|small|medium|large (bigger = better + slower)
+whisper_device: "cpu"     # "cuda" if you have an NVIDIA GPU
+
+# Tiered ALIGNER settings (only used when OpenSubtitles supplies a raw subtitle):
 # Minimum alignment confidence to ACCEPT a re-synced subtitle. Below this, the
-# original subtitle is kept unchanged (guards against making a good sub worse).
+# original is kept unchanged (guards against making a good sub worse).
 sub_min_confidence: "0.55"
-# WhisperX is the authoritative Tier-3 forced-alignment path. It is OPT-IN
-# because it needs PyTorch (GPU strongly recommended; heavy on FreeBSD).
-# ffsubsync + alass remain the always-on baseline when this is false.
+# WhisperX Tier-3 forced-alignment (opt-in; needs PyTorch, GPU recommended).
 # Env: STREAMR_WHISPERX_ENABLED
 whisperx_enabled: "false"
 
